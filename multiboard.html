@@ -1,0 +1,1654 @@
+<!DOCTYPE html>
+<!--
+PINBOARD — GitHub-backed multi-board pinboard app
+
+Multiple boards via URL hash: multiboard.html#boardname
+Default board: "pc" (loads from boards/pc.json, or migrates legacy board.json)
+
+Board data:   boards/{name}.json in GitHub repo
+Board index:  boards/index.json — array of {name, label}
+Files/images: files/{boardName}/ directory in the repo
+localStorage: pinboard_cache_{name} per board
+-->
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Pinboard</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+
+  body {
+    background: #0e0e0e;
+    overflow: hidden;
+    font-family: -apple-system, 'Segoe UI', sans-serif;
+    color: #ddd;
+    user-select: none;
+  }
+
+  #canvas {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    cursor: default;
+  }
+
+  #canvas.panning { cursor: grabbing; }
+
+  #string-layer {
+    position: absolute;
+    top: 0; left: 0;
+    width: 20000px; height: 20000px;
+    transform-origin: 0 0;
+    pointer-events: none;
+  }
+
+  #world {
+    position: absolute;
+    top: 0; left: 0;
+    width: 20000px; height: 20000px;
+    transform-origin: 0 0;
+  }
+
+  svg#strings {
+    position: absolute;
+    top: 0; left: 0;
+    width: 100%; height: 100%;
+    overflow: visible;
+  }
+
+  svg#strings line { stroke: #555; stroke-width: 1.5; stroke-dasharray: 8 5; }
+  svg#strings line.preview { stroke: #aaa; stroke-width: 1; opacity: 0.6; }
+
+  .card {
+    position: absolute;
+    min-width: 80px;
+    max-width: none;
+    width: 180px;
+    resize: both;
+    overflow: hidden;
+    background: #1a1a1a;
+    border: 1px solid #333;
+    border-radius: 4px;
+    box-shadow: 0 3px 12px rgba(0,0,0,0.6);
+    cursor: move;
+    font-size: 13px;
+    line-height: 1.5;
+  }
+
+  .card:hover { border-color: #555; box-shadow: 0 6px 24px rgba(0,0,0,0.8); }
+  .card.selected { outline: 2px solid #5b9bd5; outline-offset: -1px; }
+  .card.group-selected { outline: 2px solid #ffca28; outline-offset: -1px; }
+
+  .card-header {
+    padding: 8px 30px 6px 10px;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  .card-title {
+    font-weight: 600;
+    font-size: 13px;
+    outline: none;
+    flex: 1;
+    min-width: 0;
+    color: #eee;
+  }
+
+  .card-title:empty::before { content: 'Title...'; color: #444; font-weight: 400; }
+
+  .card-content { padding: 0 10px 8px 10px; }
+
+  .card-body {
+    outline: none;
+    color: #bbb;
+    font-size: 12px;
+    min-height: 14px;
+    word-break: break-word;
+    white-space: pre-wrap;
+  }
+
+  .card-body:empty::before { content: 'Notes...'; color: #383838; }
+  .card [contenteditable="true"] { user-select: text; cursor: text; }
+
+  .card-url-row {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+    margin-bottom: 6px;
+    padding: 4px 6px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 3px;
+  }
+
+  .card-url-row .url-icon { font-size: 12px; color: #555; flex-shrink: 0; }
+
+  .card-url {
+    font-size: 11px;
+    color: #5b9bd5;
+    outline: none;
+    flex: 1;
+    min-width: 0;
+    overflow: hidden;
+    text-overflow: ellipsis;
+    white-space: nowrap;
+  }
+
+  .card-url:empty::before { content: 'https://...'; color: #333; }
+  .card-url a { color: #5b9bd5; text-decoration: none; }
+  .card-url a:hover { text-decoration: underline; }
+
+  .checklist { padding: 4px 10px 8px 10px; list-style: none; margin: 0; }
+  .checklist-item {
+    display: flex;
+    align-items: flex-start;
+    gap: 6px;
+    padding: 3px 0;
+    font-size: 12px;
+    color: #bbb;
+  }
+  .checklist-item input[type="checkbox"] {
+    margin-top: 2px;
+    flex-shrink: 0;
+    cursor: pointer;
+    accent-color: #5b9bd5;
+  }
+  .checklist-item .check-label {
+    flex: 1;
+    outline: none;
+    min-width: 0;
+    word-break: break-word;
+  }
+  .checklist-item.checked .check-label { text-decoration: line-through; color: #555; }
+  .checklist-item .check-delete {
+    opacity: 0;
+    cursor: pointer;
+    color: #666;
+    font-size: 14px;
+    line-height: 1;
+    flex-shrink: 0;
+  }
+  .checklist-item:hover .check-delete { opacity: 1; }
+  .checklist-item .check-delete:hover { color: #ef5350; }
+  .checklist-add {
+    padding: 4px 10px 8px 10px;
+    font-size: 11px;
+    color: #444;
+    cursor: pointer;
+  }
+  .checklist-add:hover { color: #888; }
+
+  .card-image {
+    width: 100%;
+    max-height: 200px;
+    object-fit: cover;
+    border-radius: 3px 3px 0 0;
+    display: block;
+  }
+
+  .card-file-info {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 6px 8px;
+    margin-bottom: 6px;
+    background: rgba(255,255,255,0.03);
+    border-radius: 3px;
+  }
+
+  .file-name { font-size: 11px; color: #aaa; word-break: break-all; }
+  .file-size { font-size: 10px; color: #555; }
+
+  .card-file-preview {
+    width: 100%;
+    background: #fff;
+    border-radius: 3px 3px 0 0;
+    overflow: hidden;
+  }
+
+  .card-file-preview canvas,
+  .card-file-preview img {
+    width: 100%;
+    max-height: 120px;
+    object-fit: cover;
+    object-position: top;
+    display: block;
+  }
+
+  .card .delete-btn {
+    position: absolute;
+    top: 6px; right: 8px;
+    font-size: 14px;
+    opacity: 0;
+    cursor: pointer;
+    color: #555;
+    line-height: 1;
+    z-index: 2;
+  }
+
+  .card:hover .delete-btn { opacity: 1; }
+  .card .delete-btn:hover { color: #e55; }
+
+  /* Selection box */
+  #select-box {
+    position: absolute;
+    border: 1px solid #5b9bd5;
+    background: rgba(91,155,213,0.1);
+    pointer-events: none;
+    z-index: 10;
+    display: none;
+  }
+
+  #toolbar {
+    position: fixed;
+    bottom: 16px; left: 50%;
+    transform: translateX(-50%);
+    display: flex;
+    gap: 6px;
+    padding: 6px 10px;
+    background: rgba(10,10,10,0.85);
+    border: 1px solid #2a2a2a;
+    border-radius: 8px;
+    backdrop-filter: blur(12px);
+    z-index: 100;
+  }
+
+  #toolbar button {
+    padding: 6px 12px;
+    border: 1px solid #333;
+    border-radius: 4px;
+    background: transparent;
+    color: #999;
+    font-family: inherit;
+    font-size: 12px;
+    cursor: pointer;
+    transition: all 0.12s;
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  #toolbar button:hover { background: #222; color: #fff; border-color: #555; }
+  #toolbar button.active { background: #252525; color: #fff; border-color: #666; }
+  #toolbar .sep { width: 1px; background: #2a2a2a; margin: 0 2px; }
+
+  #status {
+    position: fixed;
+    bottom: 16px; right: 16px;
+    font-size: 11px;
+    color: #333;
+    z-index: 100;
+  }
+
+  #help {
+    position: fixed;
+    top: 10px; left: 14px;
+    font-size: 10px;
+    color: #2a2a2a;
+    line-height: 1.8;
+    z-index: 100;
+  }
+
+  #drop-overlay {
+    display: none;
+    position: fixed;
+    top: 0; left: 0; right: 0; bottom: 0;
+    background: rgba(40,80,120,0.15);
+    border: 3px dashed #3a6a9a;
+    z-index: 300;
+    justify-content: center;
+    align-items: center;
+    font-size: 18px;
+    color: #5b9bd5;
+    pointer-events: none;
+  }
+
+  #drop-overlay.visible { display: flex; }
+
+  #toast {
+    position: fixed;
+    top: 20px;
+    left: 50%;
+    transform: translateX(-50%) translateY(-80px);
+    padding: 10px 20px;
+    border-radius: 6px;
+    font-size: 13px;
+    color: #fff;
+    z-index: 400;
+    opacity: 0;
+    transition: transform 0.3s ease, opacity 0.3s ease;
+    pointer-events: none;
+  }
+  #toast.visible { transform: translateX(-50%) translateY(0); opacity: 1; }
+  #toast.success { background: #2e7d32; }
+  #toast.error { background: #c62828; }
+
+  /* Board switcher */
+  #board-switcher {
+    position: fixed;
+    top: 12px; right: 14px;
+    z-index: 150;
+    display: flex;
+    align-items: center;
+    gap: 6px;
+  }
+
+  #board-switcher select {
+    background: #1a1a1a;
+    color: #aaa;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 5px 8px;
+    font-size: 12px;
+    font-family: inherit;
+    cursor: pointer;
+    outline: none;
+  }
+  #board-switcher select:hover { border-color: #555; color: #fff; }
+  #board-switcher select:focus { border-color: #5b9bd5; }
+
+  #board-switcher button {
+    background: transparent;
+    color: #555;
+    border: 1px solid #333;
+    border-radius: 4px;
+    padding: 4px 8px;
+    font-size: 12px;
+    cursor: pointer;
+    font-family: inherit;
+  }
+  #board-switcher button:hover { background: #222; color: #fff; border-color: #555; }
+</style>
+</head>
+<body>
+
+<div id="toast"></div>
+<div id="canvas">
+  <div id="string-layer">
+    <svg id="strings"></svg>
+  </div>
+  <div id="world">
+  </div>
+  <div id="select-box"></div>
+</div>
+
+<div id="board-switcher">
+  <select id="board-select"></select>
+  <button id="board-new" title="New board">+</button>
+  <button id="board-rename" title="Rename board">✎</button>
+</div>
+
+<div id="toolbar">
+  <button onclick="setTool('note')" id="btn-note">📝 Note</button>
+  <button onclick="setTool('checklist')" id="btn-checklist">☑ List</button>
+  <button onclick="setTool('link')" id="btn-link">🔗 Link</button>
+  <div class="sep"></div>
+  <button onclick="triggerImageUpload()" id="btn-image">🖼 Image</button>
+  <button onclick="triggerFileUpload()" id="btn-file">📎 File</button>
+</div>
+
+<div id="status"></div>
+<div id="help">
+  dbl-click — add card · drag file/image — attach · click+drag — pan · scroll — zoom<br>
+  dbl-click card — edit · right-click — color / connect · shift+drag — select group · backspace — delete · cmd+z — undo<br>
+  cmd+s — sync to github
+</div>
+<div id="drop-overlay">Drop files or images here</div>
+
+<input type="file" id="image-input" accept="image/*" style="display:none" multiple>
+<input type="file" id="file-input" style="display:none" multiple>
+
+<script>
+// ── Board identity (from URL hash) ──
+
+function getBoardName() {
+  return (location.hash.slice(1) || 'pc').replace(/[^a-zA-Z0-9_-]/g, '');
+}
+
+let BOARD_NAME = getBoardName();
+let STORAGE_KEY = 'pinboard_' + BOARD_NAME;
+
+const canvas = document.getElementById('canvas');
+const world = document.getElementById('world');
+const stringLayer = document.getElementById('string-layer');
+const stringSvg = document.getElementById('strings');
+const statusEl = document.getElementById('status');
+const toastEl = document.getElementById('toast');
+
+function toast(msg, type) {
+  toastEl.textContent = msg;
+  toastEl.className = type || 'success';
+  requestAnimationFrame(() => { toastEl.classList.add('visible'); });
+  clearTimeout(toast._t);
+  toast._t = setTimeout(() => { toastEl.classList.remove('visible'); }, 2500);
+}
+const dropOverlay = document.getElementById('drop-overlay');
+const imageInput = document.getElementById('image-input');
+const fileInput = document.getElementById('file-input');
+const selectBox = document.getElementById('select-box');
+
+const COLORS = ['#666','#4caf50','#42a5f5','#ab47bc','#ffca28','#ef5350','#ff9800','#26c6da','#ec407a','#8d6e63'];
+
+  function blendColor(hex, base, t) {
+    const h = s => parseInt(hex.slice(s, s+2), 16);
+    const b = s => parseInt(base.slice(s, s+2), 16);
+    const m = (a, c) => Math.round(a + (c - a) * t).toString(16).padStart(2, '0');
+    return '#' + m(b(1), h(1)) + m(b(3), h(3)) + m(b(5), h(5));
+  }
+
+let state = { cards: [], strings: [], view: { x: 0, y: 0, zoom: 1 } };
+let tool = 'note';
+let selectedCard = null;
+let groupSelected = new Set();
+let dragging = null;
+let groupDragging = false;
+let groupDragStart = null;
+let groupOrigPositions = {};
+let panning = false;
+let panStart = { x: 0, y: 0 };
+let connecting = null;
+let spaceHeld = false;
+let nextId = 1;
+let editing = false;
+let undoStack = [];
+
+let selecting = false;
+let selStart = { x: 0, y: 0 };
+
+// ── Persistence (GitHub-backed, multi-board) ──
+
+const GH_REPO = 'cameron-mahon/pinboard';
+const GH_BRANCH = 'main';
+
+function boardPath() { return 'boards/' + BOARD_NAME + '.json'; }
+function filesDir() { return 'files/' + BOARD_NAME; }
+const INDEX_PATH = 'boards/index.json';
+
+let pendingFiles = new Map();
+let boardSha = null;
+let indexSha = null;
+let boardIndex = [];
+let dirty = false;
+
+function getToken() {
+  return localStorage.getItem('pinboard_gh_token');
+}
+
+function setupGitHub() {
+  const token = prompt('GitHub personal access token (Contents read/write on cameron-mahon/pinboard):');
+  if (!token) return false;
+  localStorage.setItem('pinboard_gh_token', token);
+  return true;
+}
+
+let blobUrls = {};
+
+function fileUrl(card) {
+  if (card.dataUrl) return card.dataUrl;
+  if (card.filePath && blobUrls[card.filePath]) return blobUrls[card.filePath];
+  return '';
+}
+
+function rawUrl(filePath) {
+  if (blobUrls[filePath]) return blobUrls[filePath];
+  return `https://raw.githubusercontent.com/${GH_REPO}/${GH_BRANCH}/${filePath}`;
+}
+
+async function fetchFileBlobs() {
+  const token = getToken();
+  if (!token) return;
+  const fileCards = state.cards.filter(c => c.filePath && !c.dataUrl && !blobUrls[c.filePath]);
+  for (const card of fileCards) {
+    try {
+      const res = await fetch(`https://api.github.com/repos/${GH_REPO}/contents/${card.filePath}`, {
+        headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.raw' }
+      });
+      if (!res.ok) continue;
+      const blob = await res.blob();
+      blobUrls[card.filePath] = URL.createObjectURL(blob);
+    } catch(e) { console.error('Failed to fetch', card.filePath, e); }
+  }
+  render();
+}
+
+async function ghApi(path, opts = {}) {
+  const token = getToken();
+  if (!token) throw new Error('No GitHub token');
+  return fetch(`https://api.github.com/repos/${GH_REPO}/contents/${path}`, {
+    ...opts,
+    headers: { 'Authorization': `token ${token}`, 'Content-Type': 'application/json', ...opts.headers }
+  });
+}
+
+// ── Board index ──
+
+async function loadIndex() {
+  try {
+    const token = getToken();
+    if (!token) return;
+    const res = await ghApi(INDEX_PATH);
+    if (res.ok) {
+      const data = await res.json();
+      indexSha = data.sha;
+      boardIndex = JSON.parse(atob(data.content));
+    } else {
+      boardIndex = [];
+      indexSha = null;
+    }
+  } catch(e) {
+    boardIndex = [];
+    indexSha = null;
+  }
+}
+
+async function saveIndex() {
+  const content = btoa(unescape(encodeURIComponent(JSON.stringify(boardIndex, null, 2))));
+  const body = { message: 'update board index', content, branch: GH_BRANCH };
+  if (indexSha) body.sha = indexSha;
+  try {
+    const res = await ghApi(INDEX_PATH, { method: 'PUT', body: JSON.stringify(body) });
+    if (res.ok) {
+      const result = await res.json();
+      indexSha = result.content.sha;
+    }
+  } catch(e) { console.error('Index save failed:', e); }
+}
+
+function ensureBoardInIndex(name, label) {
+  if (!boardIndex.some(b => b.name === name)) {
+    boardIndex.push({ name, label: label || name });
+  }
+}
+
+function renderBoardSwitcher() {
+  const sel = document.getElementById('board-select');
+  sel.innerHTML = '';
+  const seen = new Set();
+  boardIndex.forEach(b => {
+    seen.add(b.name);
+    const opt = document.createElement('option');
+    opt.value = b.name;
+    opt.textContent = b.label || b.name;
+    if (b.name === BOARD_NAME) opt.selected = true;
+    sel.appendChild(opt);
+  });
+  if (!seen.has(BOARD_NAME)) {
+    const opt = document.createElement('option');
+    opt.value = BOARD_NAME;
+    opt.textContent = BOARD_NAME;
+    opt.selected = true;
+    sel.appendChild(opt);
+  }
+}
+
+document.getElementById('board-select').addEventListener('change', e => {
+  location.hash = e.target.value;
+  location.reload();
+});
+
+document.getElementById('board-new').addEventListener('click', () => {
+  const name = prompt('Board name (letters, numbers, dashes):');
+  if (!name) return;
+  const clean = name.replace(/[^a-zA-Z0-9_-]/g, '');
+  if (!clean) return;
+  location.hash = clean;
+  location.reload();
+});
+
+document.getElementById('board-rename').addEventListener('click', () => {
+  const entry = boardIndex.find(b => b.name === BOARD_NAME);
+  const current = entry ? entry.label : BOARD_NAME;
+  const label = prompt('Display name for this board:', current);
+  if (!label) return;
+  ensureBoardInIndex(BOARD_NAME, label);
+  const e = boardIndex.find(b => b.name === BOARD_NAME);
+  if (e) e.label = label;
+  saveIndex().then(() => {
+    renderBoardSwitcher();
+    toast('Board renamed', 'success');
+  });
+});
+
+// ── Load / Save ──
+
+async function loadFromGitHub() {
+  try {
+    const token = getToken();
+    if (!token) return null;
+
+    // Try board-specific path first
+    let res = await ghApi(boardPath());
+    if (res.ok) {
+      const data = await res.json();
+      boardSha = data.sha;
+      return JSON.parse(atob(data.content));
+    }
+
+    // For "pc" board, fall back to legacy board.json
+    if (BOARD_NAME === 'pc') {
+      res = await ghApi('board.json');
+      if (res.ok) {
+        const data = await res.json();
+        // Don't set boardSha — we'll create boards/pc.json on first sync
+        boardSha = null;
+        return JSON.parse(atob(data.content));
+      }
+    }
+
+    return null;
+  } catch (e) {
+    console.error('GitHub load failed:', e);
+    return null;
+  }
+}
+
+async function uploadFile(filePath, base64Content) {
+  let sha;
+  try {
+    const existing = await ghApi(filePath);
+    if (existing.ok) sha = (await existing.json()).sha;
+  } catch(e) {}
+  const body = { message: `upload ${filePath}`, content: base64Content, branch: GH_BRANCH };
+  if (sha) body.sha = sha;
+  const res = await ghApi(filePath, { method: 'PUT', body: JSON.stringify(body) });
+  if (!res.ok) throw new Error(`Upload ${filePath} failed: ${res.status}`);
+  return res.json();
+}
+
+async function syncToGitHub() {
+  let token = getToken();
+  if (!token) { if (!setupGitHub()) return false; token = getToken(); }
+
+  try {
+    const dir = filesDir();
+
+    // Upload pending files
+    for (const [cardId, fileData] of pendingFiles) {
+      const card = state.cards.find(c => c.id === cardId);
+      if (!card) continue;
+      const safeName = fileData.fileName.replace(/[^a-zA-Z0-9._-]/g, '_');
+      const filePath = `${dir}/${cardId}_${safeName}`;
+      const base64 = fileData.dataUrl.split(',')[1];
+      await uploadFile(filePath, base64);
+      card.filePath = filePath;
+    }
+    pendingFiles.clear();
+
+    // Migrate legacy cards with dataUrl
+    for (const card of state.cards) {
+      if (card.dataUrl && !card.filePath && (card.type === 'image' || card.type === 'file')) {
+        const safeName = (card.fileName || 'file').replace(/[^a-zA-Z0-9._-]/g, '_');
+        const filePath = `${dir}/${card.id}_${safeName}`;
+        const base64 = card.dataUrl.split(',')[1];
+        await uploadFile(filePath, base64);
+        card.filePath = filePath;
+      }
+    }
+
+    // Save board JSON
+    const stateToSave = {
+      cards: state.cards.map(c => {
+        const copy = { ...c };
+        delete copy.dataUrl;
+        return copy;
+      }),
+      strings: state.strings,
+      view: state.view
+    };
+    const content = btoa(unescape(encodeURIComponent(JSON.stringify(stateToSave, null, 2))));
+    const body = { message: `pinboard sync: ${BOARD_NAME}`, content, branch: GH_BRANCH };
+    if (boardSha) body.sha = boardSha;
+    const res = await ghApi(boardPath(), { method: 'PUT', body: JSON.stringify(body) });
+    if (!res.ok) throw new Error(`${boardPath()} save failed: ${res.status}`);
+    const result = await res.json();
+    boardSha = result.content.sha;
+
+    state.cards.forEach(c => { if (c.filePath) delete c.dataUrl; });
+
+    // Update index
+    ensureBoardInIndex(BOARD_NAME, BOARD_NAME);
+    await saveIndex();
+    renderBoardSwitcher();
+
+    saveToCache();
+    dirty = false;
+    return true;
+  } catch (e) {
+    console.error('Sync failed:', e);
+    return false;
+  }
+}
+
+async function load() {
+  statusEl.textContent = 'loading...';
+
+  const ghData = await loadFromGitHub();
+  if (ghData) {
+    state = { cards: ghData.cards || [], strings: ghData.strings || [], view: ghData.view || { x: 0, y: 0, zoom: 1 } };
+    statusEl.textContent = state.cards.length + ' items · synced';
+  } else {
+    try {
+      const raw = localStorage.getItem(STORAGE_KEY);
+      if (raw) {
+        const s = JSON.parse(raw);
+        state = { cards: s.cards || [], strings: s.strings || [], view: s.view || { x: 0, y: 0, zoom: 1 } };
+      }
+    } catch(e) { console.error('load error', e); }
+    statusEl.textContent = state.cards.length + ' items · offline';
+  }
+
+  state.cards.forEach(c => {
+    if ((c.type === 'file' || c.type === 'image') && c.title === c.fileName) c.title = '';
+  });
+  state.cards = state.cards.filter(c => c.title || c.text || c.url || c.dataUrl || c.filePath || c.fileName || (c.items && c.items.length));
+  if (state.cards.length) nextId = Math.max(...state.cards.map(c => c.id)) + 1;
+
+  render();
+}
+
+function snapshot() {
+  undoStack.push(JSON.stringify({ cards: state.cards, strings: state.strings }));
+  if (undoStack.length > 50) undoStack.shift();
+}
+
+function undo() {
+  if (!undoStack.length) return;
+  const prev = JSON.parse(undoStack.pop());
+  state.cards = prev.cards;
+  state.strings = prev.strings;
+  render();
+  save(true);
+}
+
+function saveToCache() {
+  try {
+    const cacheState = {
+      ...state,
+      cards: state.cards.map(c => {
+        if (c.filePath) {
+          const copy = { ...c };
+          delete copy.dataUrl;
+          return copy;
+        }
+        return c;
+      })
+    };
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(cacheState));
+  } catch(e) {}
+}
+
+function save(skipSnapshot) {
+  dirty = true;
+  saveToCache();
+  statusEl.textContent = state.cards.length + ' items · unsaved';
+  clearTimeout(save._t);
+  save._t = setTimeout(() => {
+    statusEl.textContent = state.cards.length + ' items' + (dirty ? ' · unsaved' : '');
+  }, 2000);
+}
+
+// ── View ──
+
+function applyView() {
+  const t = `translate(${state.view.x}px, ${state.view.y}px) scale(${state.view.zoom})`;
+  world.style.transform = t;
+  stringLayer.style.transform = t;
+}
+
+function screenToWorld(sx, sy) {
+  return { x: (sx - state.view.x) / state.view.zoom, y: (sy - state.view.y) / state.view.zoom };
+}
+
+// ── Card HTML ──
+
+function cardHTML(card) {
+  let inner = '';
+
+  if (card.type === 'image') {
+    const src = fileUrl(card);
+    if (src) inner += `<img class="card-image" src="${src}" alt="">`;
+  }
+
+  inner += `<div class="card-header">
+    <div class="card-title">${esc(card.title || '')}</div>
+  </div>`;
+
+  if (card.type === 'file') {
+    const ext = (card.fileName || '').split('.').pop().toLowerCase();
+    if (ext === 'pdf' && (card.dataUrl || card.filePath || card.thumbnail)) {
+      if (card.thumbnail) {
+        inner += `<div class="card-file-preview"><img src="${card.thumbnail}" style="width:100%;display:block;"></div>`;
+      } else {
+        inner += `<div class="card-file-preview" data-pdf="${card.id}"></div>`;
+      }
+    } else if (['jpg','jpeg','png','gif','webp','bmp','svg'].includes(ext)) {
+      const src = fileUrl(card);
+      if (src) inner += `<img class="card-image" src="${src}" alt="">`;
+    }
+    inner += `<div class="card-file-info">
+      <div><div class="file-name">${esc(card.fileName || 'file')}</div>
+      <div class="file-size">${formatSize(card.fileSize || 0)}</div></div>
+    </div>`;
+  }
+
+  if (card.type === 'checklist') {
+    const items = card.items || [];
+    inner += `<ul class="checklist">`;
+    items.forEach((item, i) => {
+      inner += `<li class="checklist-item${item.done ? ' checked' : ''}" data-idx="${i}">
+        <input type="checkbox" ${item.done ? 'checked' : ''}>
+        <span class="check-label">${esc(item.text || '')}</span>
+        <span class="check-delete">&times;</span>
+      </li>`;
+    });
+    inner += `</ul>`;
+    inner += `<div class="checklist-add">+ Add item</div>`;
+  } else if (card.type === 'link') {
+    const urlDisplay = card.url
+      ? `<a href="${escAttr(card.url)}" target="_blank" rel="noopener">${esc(card.url)}</a>`
+      : '';
+    inner += `<div class="card-content">
+      <div class="card-url-row">
+        <span class="url-icon">🔗</span>
+        <div class="card-url" data-field="url">${urlDisplay}</div>
+      </div>
+      <div class="card-body">${esc(card.text || '')}</div>
+    </div>`;
+  } else {
+    inner += `<div class="card-content">
+      <div class="card-body">${esc(card.text || '')}</div>
+    </div>`;
+  }
+
+  inner += `<div class="delete-btn">&times;</div>`;
+  return inner;
+}
+
+function rebindChecklist(card, el) {
+  el.querySelectorAll('.checklist-item input[type="checkbox"]').forEach(cb => {
+    cb.addEventListener('click', e => { e.stopPropagation(); });
+    cb.addEventListener('change', e => {
+      e.stopPropagation();
+      const li = cb.closest('.checklist-item');
+      const idx = parseInt(li.dataset.idx);
+      snapshot();
+      card.items[idx].done = cb.checked;
+      li.classList.toggle('checked', cb.checked);
+      save();
+    });
+  });
+  el.querySelectorAll('.check-delete').forEach(btn => {
+    btn.addEventListener('click', e => {
+      e.stopPropagation();
+      const idx = parseInt(btn.closest('.checklist-item').dataset.idx);
+      snapshot();
+      card.items.splice(idx, 1);
+      el.innerHTML = cardHTML(card);
+      rebindChecklist(card, el);
+      save();
+    });
+  });
+  const addBtn = el.querySelector('.checklist-add');
+  if (addBtn) {
+    addBtn.addEventListener('click', e => {
+      e.stopPropagation();
+      snapshot();
+      card.items.push({ text: '', done: false });
+      el.innerHTML = cardHTML(card);
+      rebindChecklist(card, el);
+      save();
+      const labels = el.querySelectorAll('.check-label');
+      const last = labels[labels.length - 1];
+      if (last) { last.contentEditable = 'true'; last.focus(); }
+    });
+  }
+  el.querySelectorAll('.check-label').forEach(label => {
+    label.addEventListener('dblclick', e => {
+      e.stopPropagation();
+      label.contentEditable = 'true';
+      label.focus();
+      editing = true;
+    });
+    label.addEventListener('blur', () => {
+      label.contentEditable = 'false';
+      const idx = parseInt(label.closest('.checklist-item').dataset.idx);
+      card.items[idx].text = label.innerText.trim();
+      editing = false;
+      save();
+    });
+    label.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Enter') {
+        e.preventDefault();
+        label.blur();
+        const addB = el.querySelector('.checklist-add');
+        if (addB) addB.click();
+      }
+      if (e.key === 'Escape') { label.blur(); }
+    });
+  });
+}
+
+function createCardEl(card) {
+  const el = document.createElement('div');
+  el.className = 'card';
+  el.dataset.id = card.id;
+  el.style.left = card.x + 'px';
+  el.style.top = card.y + 'px';
+  if (card.color && card.color !== '#666') {
+    el.style.background = blendColor(card.color, '#1a1a1a', 0.15);
+    el.style.borderColor = blendColor(card.color, '#333333', 0.35);
+  }
+  el.innerHTML = cardHTML(card);
+
+  const title = el.querySelector('.card-title');
+  const body = el.querySelector('.card-body');
+  const urlField = el.querySelector('.card-url');
+  const delBtn = el.querySelector('.delete-btn');
+  const editables = [title, body, urlField].filter(Boolean);
+
+  if (card.type === 'checklist') {
+    if (!card.items) card.items = [];
+
+    el.querySelectorAll('.checklist-item input[type="checkbox"]').forEach(cb => {
+      cb.addEventListener('click', e => { e.stopPropagation(); });
+      cb.addEventListener('change', e => {
+        e.stopPropagation();
+        const li = cb.closest('.checklist-item');
+        const idx = parseInt(li.dataset.idx);
+        snapshot();
+        card.items[idx].done = cb.checked;
+        li.classList.toggle('checked', cb.checked);
+        save();
+      });
+    });
+
+    el.querySelectorAll('.check-delete').forEach(btn => {
+      btn.addEventListener('click', e => {
+        e.stopPropagation();
+        const idx = parseInt(btn.closest('.checklist-item').dataset.idx);
+        snapshot();
+        card.items.splice(idx, 1);
+        el.innerHTML = cardHTML(card);
+        rebindChecklist(card, el);
+        save();
+      });
+    });
+
+    const addBtn = el.querySelector('.checklist-add');
+    if (addBtn) {
+      addBtn.addEventListener('click', e => {
+        e.stopPropagation();
+        snapshot();
+        card.items.push({ text: '', done: false });
+        el.innerHTML = cardHTML(card);
+        rebindChecklist(card, el);
+        save();
+        const labels = el.querySelectorAll('.check-label');
+        const last = labels[labels.length - 1];
+        if (last) { last.contentEditable = 'true'; last.focus(); }
+      });
+    }
+
+    el.querySelectorAll('.check-label').forEach(label => {
+      label.addEventListener('dblclick', e => {
+        e.stopPropagation();
+        label.contentEditable = 'true';
+        label.focus();
+        editing = true;
+      });
+      label.addEventListener('blur', () => {
+        label.contentEditable = 'false';
+        const idx = parseInt(label.closest('.checklist-item').dataset.idx);
+        card.items[idx].text = label.innerText.trim();
+        editing = false;
+        save();
+      });
+      label.addEventListener('keydown', e => {
+        e.stopPropagation();
+        if (e.key === 'Enter') {
+          e.preventDefault();
+          label.blur();
+          const addB = el.querySelector('.checklist-add');
+          if (addB) addB.click();
+        }
+        if (e.key === 'Escape') { label.blur(); }
+      });
+    });
+  }
+
+  // Drag (single or group)
+  el.addEventListener('mousedown', e => {
+    if (e.target.closest('.delete-btn')) return;
+    if (editing) return;
+    e.stopPropagation();
+
+    if (groupSelected.has(card.id)) {
+      groupDragging = true;
+      groupDragStart = { x: e.clientX, y: e.clientY };
+      groupOrigPositions = {};
+      groupSelected.forEach(id => {
+        const c = state.cards.find(cc => cc.id === id);
+        if (c) groupOrigPositions[id] = { x: c.x, y: c.y };
+      });
+    } else {
+      if (!e.shiftKey) {
+        groupSelected.clear();
+        updateGroupHighlights();
+      }
+      selectCard(card.id);
+      dragging = { id: card.id, startX: e.clientX, startY: e.clientY, origX: card.x, origY: card.y };
+    }
+  });
+
+  el.addEventListener('dblclick', e => {
+    e.stopPropagation();
+    startEdit(card, el);
+  });
+
+  function commitEdit() {
+    editing = false;
+    editables.forEach(f => { if (f) f.contentEditable = 'false'; });
+    card.title = title.innerText.trim();
+    card.text = body.innerText.trim();
+    if (urlField) {
+      const raw = urlField.innerText.trim();
+      card.url = raw;
+      urlField.innerHTML = raw
+        ? `<a href="${escAttr(raw)}" target="_blank" rel="noopener">${esc(raw)}</a>`
+        : '';
+    }
+    save();
+  }
+
+  editables.forEach(f => {
+    if (!f) return;
+    f.addEventListener('blur', () => {
+      setTimeout(() => {
+        if (!editables.some(ef => ef && ef === document.activeElement)) commitEdit();
+      }, 50);
+    });
+    f.addEventListener('keydown', e => {
+      e.stopPropagation();
+      if (e.key === 'Escape') { commitEdit(); return; }
+      if (e.key === 'Tab') {
+        e.preventDefault();
+        const idx = editables.indexOf(f);
+        const next = editables[(idx + 1) % editables.length];
+        if (next) next.focus();
+      }
+    });
+  });
+
+  // Drop file onto card
+  el.addEventListener('dragover', e => { e.preventDefault(); el.style.outline = '2px solid #5b9bd5'; });
+  el.addEventListener('dragleave', () => { el.style.outline = ''; });
+  el.addEventListener('drop', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    el.style.outline = '';
+    if (e.dataTransfer.files.length) {
+      const file = e.dataTransfer.files[0];
+      const reader = new FileReader();
+      reader.onload = ev => {
+        card.dataUrl = ev.target.result;
+        card.fileName = file.name;
+        card.fileSize = file.size;
+        card.fileType = file.type;
+        if (file.type.startsWith('image/')) card.type = 'image';
+        card.thumbnail = '';
+        delete card.filePath;
+        pendingFiles.set(card.id, { dataUrl: ev.target.result, fileName: file.name });
+        const newEl = createCardEl(card);
+        el.replaceWith(newEl);
+        save();
+        setTimeout(renderPdfThumbnails, 100);
+      };
+      reader.readAsDataURL(file);
+    }
+  });
+
+  // Click PDF/file preview to open
+  const pdfPreview = el.querySelector('.card-file-preview');
+  if (pdfPreview && (card.dataUrl || card.filePath)) {
+    pdfPreview.style.cursor = 'pointer';
+    pdfPreview.addEventListener('click', e => {
+      e.stopPropagation();
+      if (card.dataUrl) {
+        const byteStr = atob(card.dataUrl.split(',')[1]);
+        const mime = card.dataUrl.split(',')[0].match(/:(.*?);/)[1];
+        const arr = new Uint8Array(byteStr.length);
+        for (let i = 0; i < byteStr.length; i++) arr[i] = byteStr.charCodeAt(i);
+        const blob = new Blob([arr], { type: mime });
+        window.open(URL.createObjectURL(blob), '_blank');
+      } else if (card.filePath) {
+        if (blobUrls[card.filePath]) {
+          window.open(blobUrls[card.filePath], '_blank');
+        } else {
+          const w = window.open('', '_blank');
+          const token = getToken();
+          if (!token) { w.close(); return; }
+          fetch(`https://api.github.com/repos/${GH_REPO}/contents/${card.filePath}`, {
+            headers: { 'Authorization': `token ${token}`, 'Accept': 'application/vnd.github.raw' }
+          }).then(res => {
+            if (!res.ok) { w.close(); return; }
+            return res.blob();
+          }).then(blob => {
+            if (!blob) return;
+            blobUrls[card.filePath] = URL.createObjectURL(blob);
+            w.location = blobUrls[card.filePath];
+          }).catch(() => w.close());
+        }
+      }
+    });
+  }
+
+  // Right-click context menu
+  el.addEventListener('contextmenu', e => {
+    e.preventDefault();
+    e.stopPropagation();
+    document.querySelectorAll('.ctx-menu').forEach(m => m.remove());
+    const menu = document.createElement('div');
+    menu.className = 'ctx-menu';
+    menu.style.cssText = `position:fixed;left:${e.clientX}px;top:${e.clientY}px;background:#1a1a1a;border:1px solid #444;border-radius:4px;padding:6px 0;z-index:200;min-width:140px;`;
+
+    const colorRow = document.createElement('div');
+    colorRow.style.cssText = 'display:flex;gap:4px;flex-wrap:wrap;padding:6px 10px;border-bottom:1px solid #333;';
+    COLORS.forEach(c => {
+      const dot = document.createElement('div');
+      dot.style.cssText = `width:16px;height:16px;border-radius:50%;background:${c};cursor:pointer;border:1px solid #555;`;
+      dot.addEventListener('click', () => {
+        card.color = c;
+        if (c === '#666') {
+          el.style.background = '#1a1a1a';
+          el.style.borderColor = '#333';
+        } else {
+          el.style.background = blendColor(c, '#1a1a1a', 0.15);
+          el.style.borderColor = blendColor(c, '#333333', 0.35);
+        }
+        save();
+        menu.remove();
+      });
+      colorRow.appendChild(dot);
+    });
+    menu.appendChild(colorRow);
+
+    const connectItem = document.createElement('div');
+    connectItem.textContent = '🔗 Connect to...';
+    connectItem.style.cssText = 'padding:6px 12px;font-size:12px;cursor:pointer;color:#aaa;';
+    connectItem.onmouseenter = () => { connectItem.style.background = '#252525'; connectItem.style.color = '#fff'; };
+    connectItem.onmouseleave = () => { connectItem.style.background = ''; connectItem.style.color = '#aaa'; };
+    connectItem.addEventListener('click', () => {
+      menu.remove();
+      connecting = { fromId: card.id };
+      canvas.style.cursor = 'crosshair';
+      const onClick = ev => {
+        const targetCard = ev.target.closest('.card');
+        if (targetCard) {
+          const toId = parseInt(targetCard.dataset.id);
+          if (toId !== card.id) {
+            const exists = state.strings.some(s =>
+              (s.from === card.id && s.to === toId) || (s.from === toId && s.to === card.id)
+            );
+            if (!exists) {
+              state.strings.push({ from: card.id, to: toId });
+              renderStrings();
+              save();
+            }
+          }
+        }
+        connecting = null;
+        canvas.style.cursor = 'default';
+        window.removeEventListener('click', onClick);
+      };
+      setTimeout(() => window.addEventListener('click', onClick), 10);
+    });
+    menu.appendChild(connectItem);
+
+    const connected = state.strings.filter(s => s.from === card.id || s.to === card.id);
+    connected.forEach(s => {
+      const otherId = s.from === card.id ? s.to : s.from;
+      const other = state.cards.find(c => c.id === otherId);
+      if (!other) return;
+      const item = document.createElement('div');
+      item.textContent = `✂ ${other.title?.slice(0, 25) || other.type}`;
+      item.style.cssText = 'padding:6px 12px;font-size:12px;cursor:pointer;color:#aaa;';
+      item.onmouseenter = () => { item.style.background = '#252525'; item.style.color = '#fff'; };
+      item.onmouseleave = () => { item.style.background = ''; item.style.color = '#aaa'; };
+      item.addEventListener('click', () => {
+        snapshot();
+        state.strings = state.strings.filter(st => st !== s);
+        renderStrings();
+        save();
+        menu.remove();
+      });
+      menu.appendChild(item);
+    });
+
+    document.body.appendChild(menu);
+    setTimeout(() => window.addEventListener('click', () => menu.remove(), { once: true }), 10);
+  });
+
+  delBtn.addEventListener('click', e => { e.stopPropagation(); deleteCard(card.id); });
+
+  if (urlField) {
+    urlField.addEventListener('click', e => {
+      if (editing && urlField.contentEditable === 'true') return;
+      const a = e.target.closest('a');
+      if (a) e.stopPropagation();
+    });
+  }
+
+  return el;
+}
+
+function startEdit(card, el) {
+  editing = true;
+  selectCard(card.id);
+  const title = el.querySelector('.card-title');
+  const body = el.querySelector('.card-body');
+  const urlField = el.querySelector('.card-url');
+  [title, body, urlField].forEach(f => { if (f) f.contentEditable = 'true'; });
+  if (urlField) urlField.textContent = card.url || '';
+  if (card.type === 'checklist') {
+    title.contentEditable = 'true';
+    title.focus();
+  } else if (card.type === 'link' && !card.url) urlField.focus();
+  else if (!card.title) title.focus();
+  else body.focus();
+}
+
+// ── Render ──
+
+function render() {
+  world.querySelectorAll('.card').forEach(el => el.remove());
+  stringSvg.querySelectorAll('line:not(.preview)').forEach(l => l.remove());
+  applyView();
+  state.cards.forEach(card => world.appendChild(createCardEl(card)));
+  renderStrings();
+  statusEl.textContent = state.cards.length + ' items';
+}
+
+function renderStrings() {
+  stringSvg.querySelectorAll('line:not(.preview)').forEach(l => l.remove());
+  state.strings.forEach(s => {
+    const from = state.cards.find(c => c.id === s.from);
+    const to = state.cards.find(c => c.id === s.to);
+    if (!from || !to) return;
+    const fromEl = world.querySelector(`[data-id="${s.from}"]`);
+    const toEl = world.querySelector(`[data-id="${s.to}"]`);
+    if (!fromEl || !toEl) return;
+    const line = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+    line.setAttribute('x1', from.x + fromEl.offsetWidth / 2);
+    line.setAttribute('y1', from.y + fromEl.offsetHeight / 2);
+    line.setAttribute('x2', to.x + toEl.offsetWidth / 2);
+    line.setAttribute('y2', to.y + toEl.offsetHeight / 2);
+    stringSvg.appendChild(line);
+  });
+}
+
+// ── Actions ──
+
+function selectCard(id) {
+  selectedCard = id;
+  world.querySelectorAll('.card').forEach(el => {
+    el.classList.toggle('selected', parseInt(el.dataset.id) === id);
+  });
+}
+
+function updateGroupHighlights() {
+  world.querySelectorAll('.card').forEach(el => {
+    el.classList.toggle('group-selected', groupSelected.has(parseInt(el.dataset.id)));
+  });
+}
+
+function deleteCard(id) {
+  snapshot();
+  state.cards = state.cards.filter(c => c.id !== id);
+  state.strings = state.strings.filter(s => s.from !== id && s.to !== id);
+  if (selectedCard === id) selectedCard = null;
+  groupSelected.delete(id);
+  render();
+  save();
+}
+
+function addCard(type, wx, wy, extra) {
+  const defaults = type === 'checklist' ? { items: [{ text: '', done: false }] } : {};
+  const card = { id: nextId++, type, title: '', text: '', x: wx, y: wy, color: '#666', ...defaults, ...extra };
+  state.cards.push(card);
+  const el = createCardEl(card);
+  world.appendChild(el);
+  save();
+  selectCard(card.id);
+  if (type === 'note' || type === 'link') startEdit(card, el);
+  if (type === 'checklist') {
+    const label = el.querySelector('.check-label');
+    if (label) { label.contentEditable = 'true'; label.focus(); editing = true; }
+  }
+  setTimeout(renderPdfThumbnails, 100);
+  return card;
+}
+
+function setTool(type) {
+  tool = type;
+  document.querySelectorAll('#toolbar button').forEach(b => b.classList.remove('active'));
+  const btn = document.getElementById('btn-' + type);
+  if (btn) btn.classList.add('active');
+}
+
+// ── File handling ──
+
+function handleFiles(files, wx, wy) {
+  let offsetY = 0;
+  Array.from(files).forEach(file => {
+    const reader = new FileReader();
+    reader.onload = e => {
+      const type = file.type.startsWith('image/') ? 'image' : 'file';
+      const card = addCard(type, wx, wy + offsetY, {
+        title: '',
+        dataUrl: e.target.result,
+        fileName: file.name,
+        fileSize: file.size,
+        fileType: file.type
+      });
+      pendingFiles.set(card.id, { dataUrl: e.target.result, fileName: file.name });
+    };
+    reader.readAsDataURL(file);
+    offsetY += 240;
+  });
+}
+
+function triggerImageUpload() { imageInput.click(); }
+function triggerFileUpload() { fileInput.click(); }
+
+imageInput.addEventListener('change', e => {
+  if (!e.target.files.length) return;
+  const vp = screenToWorld(window.innerWidth / 2 - 100, window.innerHeight / 2 - 100);
+  handleFiles(e.target.files, vp.x, vp.y);
+  e.target.value = '';
+});
+
+fileInput.addEventListener('change', e => {
+  if (!e.target.files.length) return;
+  const vp = screenToWorld(window.innerWidth / 2 - 100, window.innerHeight / 2 - 100);
+  handleFiles(e.target.files, vp.x, vp.y);
+  e.target.value = '';
+});
+
+// ── Drag & drop files ──
+
+let dragCounter = 0;
+
+canvas.addEventListener('dragenter', e => { e.preventDefault(); dragCounter++; dropOverlay.classList.add('visible'); });
+canvas.addEventListener('dragleave', () => { dragCounter--; if (dragCounter <= 0) { dragCounter = 0; dropOverlay.classList.remove('visible'); } });
+canvas.addEventListener('dragover', e => e.preventDefault());
+
+canvas.addEventListener('drop', e => {
+  e.preventDefault();
+  dragCounter = 0;
+  dropOverlay.classList.remove('visible');
+  if (e.dataTransfer.files.length) {
+    const wp = screenToWorld(e.clientX, e.clientY);
+    handleFiles(e.dataTransfer.files, wp.x, wp.y);
+    return;
+  }
+  const url = e.dataTransfer.getData('text/uri-list') || e.dataTransfer.getData('text/plain');
+  if (url && (url.startsWith('http://') || url.startsWith('https://'))) {
+    const wp = screenToWorld(e.clientX, e.clientY);
+    addCard('link', wp.x, wp.y, { url, title: '' });
+  }
+});
+
+// ── Paste URL ──
+
+document.addEventListener('paste', e => {
+  if (editing) return;
+  const text = (e.clipboardData || window.clipboardData).getData('text');
+  if (text && (text.startsWith('http://') || text.startsWith('https://'))) {
+    const vp = screenToWorld(window.innerWidth / 2 - 80, window.innerHeight / 2 - 40);
+    addCard('link', vp.x, vp.y, { url: text, title: '' });
+    e.preventDefault();
+  }
+});
+
+// ── Canvas interactions ──
+
+canvas.addEventListener('dblclick', e => {
+  if (e.target.closest('.card')) return;
+  if (editing) return;
+  const wp = screenToWorld(e.clientX, e.clientY);
+  addCard(tool || 'note', wp.x, wp.y);
+});
+
+canvas.addEventListener('mousedown', e => {
+  if (e.target.closest('.card')) return;
+  if (editing) return;
+
+  if (e.button === 0 && e.shiftKey) {
+    selecting = true;
+    selStart = { x: e.clientX, y: e.clientY };
+    selectBox.style.left = e.clientX + 'px';
+    selectBox.style.top = e.clientY + 'px';
+    selectBox.style.width = '0';
+    selectBox.style.height = '0';
+    selectBox.style.display = 'block';
+    e.preventDefault();
+    return;
+  }
+
+  if (e.button === 0 || e.button === 1 || spaceHeld) {
+    selectCard(null);
+    groupSelected.clear();
+    updateGroupHighlights();
+    panning = true;
+    panStart = { x: e.clientX - state.view.x, y: e.clientY - state.view.y };
+    canvas.classList.add('panning');
+    e.preventDefault();
+  }
+});
+
+window.addEventListener('mousemove', e => {
+  if (dragging) {
+    const dx = (e.clientX - dragging.startX) / state.view.zoom;
+    const dy = (e.clientY - dragging.startY) / state.view.zoom;
+    const card = state.cards.find(c => c.id === dragging.id);
+    if (card) {
+      card.x = dragging.origX + dx;
+      card.y = dragging.origY + dy;
+      const el = world.querySelector(`[data-id="${card.id}"]`);
+      if (el) { el.style.left = card.x + 'px'; el.style.top = card.y + 'px'; }
+      renderStrings();
+    }
+  }
+
+  if (groupDragging && groupDragStart) {
+    const dx = (e.clientX - groupDragStart.x) / state.view.zoom;
+    const dy = (e.clientY - groupDragStart.y) / state.view.zoom;
+    groupSelected.forEach(id => {
+      const card = state.cards.find(c => c.id === id);
+      const orig = groupOrigPositions[id];
+      if (card && orig) {
+        card.x = orig.x + dx;
+        card.y = orig.y + dy;
+        const el = world.querySelector(`[data-id="${id}"]`);
+        if (el) { el.style.left = card.x + 'px'; el.style.top = card.y + 'px'; }
+      }
+    });
+    renderStrings();
+  }
+
+  if (selecting) {
+    const x = Math.min(e.clientX, selStart.x);
+    const y = Math.min(e.clientY, selStart.y);
+    const w = Math.abs(e.clientX - selStart.x);
+    const h = Math.abs(e.clientY - selStart.y);
+    selectBox.style.left = x + 'px';
+    selectBox.style.top = y + 'px';
+    selectBox.style.width = w + 'px';
+    selectBox.style.height = h + 'px';
+  }
+
+  if (panning) {
+    state.view.x = e.clientX - panStart.x;
+    state.view.y = e.clientY - panStart.y;
+    applyView();
+  }
+});
+
+window.addEventListener('mouseup', e => {
+  if (dragging) { save(); dragging = null; }
+
+  if (groupDragging) {
+    groupDragging = false;
+    groupDragStart = null;
+    save();
+  }
+
+  if (selecting) {
+    selecting = false;
+    selectBox.style.display = 'none';
+
+    const boxRect = {
+      left: parseInt(selectBox.style.left),
+      top: parseInt(selectBox.style.top),
+      right: parseInt(selectBox.style.left) + parseInt(selectBox.style.width),
+      bottom: parseInt(selectBox.style.top) + parseInt(selectBox.style.height)
+    };
+
+    groupSelected.clear();
+    state.cards.forEach(card => {
+      const el = world.querySelector(`[data-id="${card.id}"]`);
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.left < boxRect.right && rect.right > boxRect.left &&
+          rect.top < boxRect.bottom && rect.bottom > boxRect.top) {
+        groupSelected.add(card.id);
+      }
+    });
+    updateGroupHighlights();
+  }
+
+  if (panning) { panning = false; canvas.classList.remove('panning'); save(); }
+
+  if (connecting) { connecting = null; canvas.style.cursor = 'default'; }
+});
+
+canvas.addEventListener('wheel', e => {
+  e.preventDefault();
+  const delta = e.deltaY > 0 ? 0.92 : 1.08;
+  const newZoom = Math.min(3, Math.max(0.1, state.view.zoom * delta));
+  const wx = (e.clientX - state.view.x) / state.view.zoom;
+  const wy = (e.clientY - state.view.y) / state.view.zoom;
+  state.view.zoom = newZoom;
+  state.view.x = e.clientX - wx * newZoom;
+  state.view.y = e.clientY - wy * newZoom;
+  applyView();
+  save();
+}, { passive: false });
+
+window.addEventListener('keydown', e => {
+  if (e.key === 'z' && (e.metaKey || e.ctrlKey) && !editing) { e.preventDefault(); undo(); return; }
+  if (e.key === 's' && (e.metaKey || e.ctrlKey)) {
+    e.preventDefault();
+    const fileCount = pendingFiles.size;
+    const migrationCount = state.cards.filter(c => c.dataUrl && !c.filePath && (c.type === 'image' || c.type === 'file')).length;
+    const uploadCount = fileCount + migrationCount;
+    toast(uploadCount ? `Syncing (${uploadCount} file${uploadCount > 1 ? 's' : ''})...` : 'Syncing...', 'success');
+    syncToGitHub().then(ok => {
+      if (ok) {
+        toast('Synced to GitHub', 'success');
+        statusEl.textContent = state.cards.length + ' items · synced';
+        render();
+      } else toast('Sync failed — check console', 'error');
+    });
+    return;
+  }
+  if (editing) return;
+  if (e.code === 'Space') { spaceHeld = true; canvas.style.cursor = 'grab'; e.preventDefault(); }
+  if ((e.key === 'Backspace' || e.key === 'Delete')) {
+    if (groupSelected.size > 0) {
+      snapshot();
+      groupSelected.forEach(id => {
+        state.cards = state.cards.filter(c => c.id !== id);
+        state.strings = state.strings.filter(s => s.from !== id && s.to !== id);
+      });
+      groupSelected.clear();
+      render();
+      save();
+    } else if (selectedCard) {
+      deleteCard(selectedCard);
+    }
+  }
+  if (e.key === 'Escape') { selectCard(null); groupSelected.clear(); updateGroupHighlights(); }
+});
+
+window.addEventListener('keyup', e => {
+  if (e.code === 'Space') { spaceHeld = false; canvas.style.cursor = 'default'; }
+});
+
+canvas.addEventListener('contextmenu', e => { e.preventDefault(); });
+
+// ── Helpers ──
+
+function esc(s) {
+  if (!s) return '';
+  const d = document.createElement('div');
+  d.textContent = s;
+  return d.innerHTML;
+}
+
+function escAttr(s) {
+  return (s || '').replace(/&/g,'&amp;').replace(/"/g,'&quot;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+}
+
+function formatSize(bytes) {
+  if (bytes < 1024) return bytes + ' B';
+  if (bytes < 1024*1024) return (bytes/1024).toFixed(1) + ' KB';
+  return (bytes/(1024*1024)).toFixed(1) + ' MB';
+}
+
+// ── PDF rendering ──
+
+function renderPdfThumbnails() {
+  if (typeof pdfjsLib === 'undefined') return;
+  pdfjsLib.GlobalWorkerOptions.workerSrc = 'https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+  document.querySelectorAll('[data-pdf]').forEach(container => {
+    if (container.querySelector('canvas')) return;
+    const cardId = parseInt(container.dataset.pdf);
+    const card = state.cards.find(c => c.id === cardId);
+    if (!card) return;
+    const src = card.dataUrl || (card.filePath && blobUrls[card.filePath]) || null;
+    if (!src) return;
+    pdfjsLib.getDocument(src).promise.then(pdf => {
+      pdf.getPage(1).then(page => {
+        const scale = 300 / page.getViewport({ scale: 1 }).width;
+        const viewport = page.getViewport({ scale });
+        const cvs = document.createElement('canvas');
+        cvs.width = viewport.width;
+        cvs.height = viewport.height;
+        page.render({ canvasContext: cvs.getContext('2d'), viewport }).promise.then(() => {
+          container.appendChild(cvs);
+          card.thumbnail = cvs.toDataURL('image/jpeg', 0.8);
+          save();
+        });
+      });
+    }).catch(err => console.error('PDF render failed:', err));
+  });
+}
+
+// ── Init ──
+
+document.title = 'Pinboard — ' + BOARD_NAME;
+setTool('note');
+
+loadIndex().then(() => {
+  renderBoardSwitcher();
+  load().then(() => {
+    fetchFileBlobs().then(() => setTimeout(renderPdfThumbnails, 200));
+  });
+});
+</script>
+</body>
+</html>
